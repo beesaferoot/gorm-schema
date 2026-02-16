@@ -161,8 +161,6 @@ func formatSQLWithLineBreaks(sql string) string {
 	sql = strings.ReplaceAll(sql, "FOREIGN KEY", "\n\t\tFOREIGN KEY")
 	sql = strings.ReplaceAll(sql, "REFERENCES", "\n\t\tREFERENCES")
 	sql = strings.ReplaceAll(sql, "ON DELETE", "\n\t\tON DELETE")
-	sql = strings.ReplaceAll(sql, "PRIMARY KEY", "\n\tPRIMARY KEY")
-	sql = strings.ReplaceAll(sql, "NOT NULL", "\n\tNOT NULL")
 	sql = strings.ReplaceAll(sql, "DEFAULT", "\n\tDEFAULT")
 	sql = strings.ReplaceAll(sql, "UNIQUE", "\n\tUNIQUE")
 
@@ -521,7 +519,7 @@ func (g *Generator) generateCreateTableSQL(table diff.TableDiff) string {
 		}
 		// Add default value if not primary key and not already set
 		if !col.PrimaryKey && col.DefaultValue != "" {
-			columnDef += fmt.Sprintf(" DEFAULT %v", col.DefaultValue)
+			columnDef += fmt.Sprintf(" DEFAULT '%v'", col.DefaultValue)
 		}
 		columns = append(columns, "    "+columnDef)
 	}
@@ -756,5 +754,9 @@ func isValidColumnType(columnType string) bool {
 
 // quoteIdentifier wraps a SQL identifier (table or column name) in double quotes
 func quoteIdentifier(name string) string {
-	return "\"" + name + "\""
+	parts := strings.Split(name, ".")
+	for i, part := range parts {
+		parts[i] = `"` + part + `"`
+	}
+	return strings.Join(parts, ".")
 }
