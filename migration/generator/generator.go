@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/beesaferoot/gorm-migrate/migration/diff"
+	"gorm.io/gorm/schema"
 )
 
 // Generator helps create new migration files
@@ -82,7 +84,10 @@ func init() {
 	migration.RegisterMigration(&migration.Migration{
 		Version:   "%s",
 		Name:      "%s",
-		CreatedAt: time.Now(),
+		CreatedAt: func() time.Time {
+			t, _ := time.Parse("20060102150405", "%s")
+			return t
+		}(),
 		Up: func(db *gorm.DB) error {
 			%s
 			return nil
@@ -93,7 +98,7 @@ func init() {
 		},
 	})
 }
-`, version, name, formatSQLAsExec(upSQL), formatSQLAsExec(downSQL))
+`, version, name, version, formatSQLAsExec(upSQL), formatSQLAsExec(downSQL))
 
 	// Write the file
 	if err := os.WriteFile(filepath, []byte(content), 0644); err != nil {
@@ -161,8 +166,6 @@ func formatSQLWithLineBreaks(sql string) string {
 	sql = strings.ReplaceAll(sql, "FOREIGN KEY", "\n\t\tFOREIGN KEY")
 	sql = strings.ReplaceAll(sql, "REFERENCES", "\n\t\tREFERENCES")
 	sql = strings.ReplaceAll(sql, "ON DELETE", "\n\t\tON DELETE")
-	sql = strings.ReplaceAll(sql, "DEFAULT", "\n\tDEFAULT")
-	sql = strings.ReplaceAll(sql, "UNIQUE", "\n\tUNIQUE")
 
 	// Add line breaks after commas in column lists
 	sql = addLineBreaksAfterCommas(sql)
@@ -332,8 +335,8 @@ func getDefaultValue(colType string, isPrimaryKey bool, tableName string) string
 	}
 
 	switch colType {
-	case "timestamp":
-		return "DEFAULT CURRENT_TIMESTAMP"
+	case "timestamp", "timestamptz":
+		return "DEFAULT now()"
 	case "boolean":
 		return "DEFAULT false"
 	case "integer", "bigint", "double precision":
@@ -408,6 +411,35 @@ func (g *Generator) generateUpSQL() (string, error) {
 	tablesToCreate, err := topoSortTables(g.SchemaDiff.TablesToCreate)
 	if err != nil {
 		return "", err
+	}
+
+	// Create schemas if necessary
+	schemas := make(map[string]bool)
+	for _, table := range tablesToCreate {
+		if strings.Contains(table.Schema.Table, ".") {
+			schema := strings.Split(table.Schema.Table, ".")[0]
+			if schema != "public" {
+				schemas[schema] = true
+			}
+		}
+	}
+	for _, table := range g.SchemaDiff.TablesToModify {
+		if strings.Contains(table.Schema.Table, ".") {
+			schema := strings.Split(table.Schema.Table, ".")[0]
+			if schema != "public" {
+				schemas[schema] = true
+			}
+		}
+	}
+
+	var sortedSchemas []string
+	for schema := range schemas {
+		sortedSchemas = append(sortedSchemas, schema)
+	}
+	sort.Strings(sortedSchemas)
+
+	for _, schema := range sortedSchemas {
+		statements = append(statements, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", quoteIdentifier(schema)))
 	}
 
 	// Create tables
@@ -509,10 +541,14 @@ func (g *Generator) generateCreateTableSQL(table diff.TableDiff) string {
 
 	// Add columns with proper formatting
 	for _, col := range table.FieldsToAdd {
-		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(string(col.DataType), col.PrimaryKey)
+		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(g.resolveColumnType(table, col), col.PrimaryKey)
 		columnDef := fmt.Sprintf("%s %s", col.DBName, sqlType)
 		if col.NotNull {
 			columnDef += " NOT NULL"
+			// Add default for not null timestamp if not already set
+			if col.DefaultValue == "" && (sqlType == "timestamp" || sqlType == "timestamptz") {
+				columnDef += " DEFAULT now()"
+			}
 		}
 		if col.PrimaryKey {
 			columnDef += " PRIMARY KEY"
@@ -531,9 +567,10 @@ func (g *Generator) generateCreateTableSQL(table diff.TableDiff) string {
 		}
 		r := fk.References[0]
 		if fk.Field != nil && fk.Schema != nil && r != nil {
-			fkDef := fmt.Sprintf("CONSTRAINT fk_%s_%s_fkey FOREIGN KEY (%s) REFERENCES %s(id) ON DELETE CASCADE",
-				table.Schema.Table,
-				r.ForeignKey.DBName,
+			fkName := fmt.Sprintf("fk_%s_%s_fkey", table.Schema.Table, r.ForeignKey.DBName)
+			fkName = g.sanitizeConstraintName(fkName)
+			fkDef := fmt.Sprintf("CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(id) ON DELETE CASCADE",
+				fkName,
 				quoteIdentifier(fk.References[0].ForeignKey.DBName),
 				quoteIdentifier(r.PrimaryKey.Schema.Table))
 			tableConstraints = append(tableConstraints, "    "+fkDef)
@@ -546,10 +583,19 @@ func (g *Generator) generateCreateTableSQL(table diff.TableDiff) string {
 		if strings.HasPrefix(idxName, "idx_idx_") {
 			idxName = strings.Replace(idxName, "idx_idx_", "idx_", 1)
 		}
-		fieldNames := make([]string, len(idx.Fields))
-		for i, f := range idx.Fields {
-			fieldNames[i] = quoteIdentifier(f.DBName)
+
+		idxName = g.sanitizeConstraintName(idxName)
+
+		// Deduplicate columns
+		var fieldNames []string
+		seenFields := make(map[string]bool)
+		for _, f := range idx.Fields {
+			if !seenFields[f.DBName] {
+				fieldNames = append(fieldNames, quoteIdentifier(f.DBName))
+				seenFields[f.DBName] = true
+			}
 		}
+
 		if strings.ToUpper(idx.Option) == "UNIQUE" {
 			idxDef := fmt.Sprintf("CONSTRAINT %s UNIQUE (%s)",
 				idxName,
@@ -586,10 +632,14 @@ func (g *Generator) generateModifyTableSQL(table diff.TableDiff) []string {
 
 	// Add columns with proper formatting
 	for _, col := range table.FieldsToAdd {
-		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(string(col.DataType), col.PrimaryKey)
+		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(g.resolveColumnType(table, col), col.PrimaryKey)
 		columnDef := fmt.Sprintf("%s %s", quoteIdentifier(col.DBName), sqlType)
 		if col.NotNull {
 			columnDef += " NOT NULL"
+			// Add default for not null timestamp if not already set
+			if col.DefaultValue == "" && (sqlType == "timestamp" || sqlType == "timestamptz") {
+				columnDef += " DEFAULT now()"
+			}
 		}
 		if col.DefaultValue != "" {
 			columnDef += fmt.Sprintf(" DEFAULT %v", col.DefaultValue)
@@ -604,10 +654,14 @@ func (g *Generator) generateModifyTableSQL(table diff.TableDiff) []string {
 
 	// Modify columns with proper formatting
 	for _, col := range table.FieldsToModify {
-		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(string(col.DataType), col.PrimaryKey)
+		sqlType := mapGoTypeToSQLTypeWithAutoIncrement(g.resolveColumnType(table, col), col.PrimaryKey)
 		columnDef := fmt.Sprintf("%s %s", quoteIdentifier(col.DBName), sqlType)
 		if col.NotNull {
 			columnDef += " NOT NULL"
+			// Add default for not null timestamp if not already set
+			if col.DefaultValue == "" && (sqlType == "timestamp" || sqlType == "timestamptz") {
+				columnDef += " DEFAULT now()"
+			}
 		}
 		if col.DefaultValue != "" {
 			columnDef += fmt.Sprintf(" DEFAULT %v", col.DefaultValue)
@@ -618,10 +672,11 @@ func (g *Generator) generateModifyTableSQL(table diff.TableDiff) []string {
 	// Add foreign keys with proper formatting
 	for _, fk := range table.ForeignKeysToAdd {
 		if fk.Field != nil && fk.Schema != nil && len(fk.References) > 0 {
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_%s_%s_fkey FOREIGN KEY (%s) REFERENCES %s(id) ON DELETE CASCADE;",
+			fkName := fmt.Sprintf("fk_%s_%s_fkey", table.Schema.Table, fk.References[0].ForeignKey.DBName)
+			fkName = g.sanitizeConstraintName(fkName)
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(id) ON DELETE CASCADE;",
 				quoteIdentifier(table.Schema.Table),
-				table.Schema.Table,
-				fk.References[0].ForeignKey.DBName,
+				fkName,
 				quoteIdentifier(fk.References[0].ForeignKey.DBName),
 				quoteIdentifier(fk.References[0].PrimaryKey.Schema.Table)),
 			)
@@ -634,10 +689,19 @@ func (g *Generator) generateModifyTableSQL(table diff.TableDiff) []string {
 		if strings.HasPrefix(idxName, "idx_idx_") {
 			idxName = strings.Replace(idxName, "idx_idx_", "idx_", 1)
 		}
-		fieldNames := make([]string, len(idx.Fields))
-		for i, f := range idx.Fields {
-			fieldNames[i] = quoteIdentifier(f.DBName)
+
+		idxName = g.sanitizeConstraintName(idxName)
+
+		// Deduplicate columns
+		var fieldNames []string
+		seenFields := make(map[string]bool)
+		for _, f := range idx.Fields {
+			if !seenFields[f.DBName] {
+				fieldNames = append(fieldNames, quoteIdentifier(f.DBName))
+				seenFields[f.DBName] = true
+			}
 		}
+
 		if strings.ToUpper(idx.Option) == "UNIQUE" {
 			statements = append(statements, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s);",
 				idxName,
@@ -698,7 +762,7 @@ func (g *Generator) validateSchemaDiff(diff *diff.SchemaDiff) error {
 
 		// Validate foreign keys
 		for _, fk := range table.ForeignKeysToAdd {
-			if fk.Field != nil {
+			if fk.Field != nil && len(fk.References) > 0 {
 				if !columnNames[table.Schema.Table][fk.References[0].ForeignKey.DBName] {
 					return fmt.Errorf("foreign key column %s does not exist in table %s", fk.References[0].ForeignKey.DBName, table.Schema.Table)
 				}
@@ -759,4 +823,30 @@ func quoteIdentifier(name string) string {
 		parts[i] = `"` + part + `"`
 	}
 	return strings.Join(parts, ".")
+}
+
+// resolveColumnType returns the appropriate Go type for a column, resolving foreign keys if necessary
+func (g *Generator) resolveColumnType(table diff.TableDiff, col *schema.Field) string {
+	// Check if this column is a foreign key
+	for _, fk := range table.ForeignKeysToAdd {
+		if fk == nil {
+			continue
+		}
+		if fk.Field != nil && fk.Field.DBName == col.DBName {
+			if len(fk.References) > 0 {
+				ref := fk.References[0]
+				// Use the referenced primary key's type if available
+				if ref.PrimaryKey != nil {
+					return string(ref.PrimaryKey.DataType)
+				}
+			}
+		}
+	}
+	// Fallback to the column's own type
+	return string(col.DataType)
+}
+
+// sanitizeConstraintName replaces dots with underscores in constraint names
+func (g *Generator) sanitizeConstraintName(name string) string {
+	return strings.ReplaceAll(name, ".", "_")
 }

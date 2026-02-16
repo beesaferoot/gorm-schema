@@ -24,6 +24,15 @@ func TestGenerateCreateTableSQL_ForeignKey(t *testing.T) {
 			{
 				Field:  &schema.Field{DBName: "user_id"},
 				Schema: &schema.Schema{Table: "users"},
+				References: []*schema.Reference{
+					{
+						PrimaryKey: &schema.Field{
+							DBName: "id",
+							Schema: &schema.Schema{Table: "users"},
+						},
+						ForeignKey: &schema.Field{DBName: "user_id"},
+					},
+				},
 			},
 		},
 	}
@@ -472,4 +481,126 @@ func TestDownMigrationGeneration(t *testing.T) {
 			t.Errorf("Down migration should include a comment for manual intervention")
 		}
 	})
+}
+func TestGenerateCreateTableSQL_DuplicateIndexColumns(t *testing.T) {
+	gen := NewGenerator("migrations")
+	table := diff.TableDiff{
+		Schema: &schema.Schema{Table: "products"},
+		FieldsToAdd: []*schema.Field{
+			{DBName: "id", DataType: "int", PrimaryKey: true, NotNull: true},
+			{DBName: "name", DataType: "string", NotNull: true},
+		},
+		IndexesToAdd: []*schema.Index{
+			{
+				Name:   "idx_products_name",
+				Fields: []schema.IndexOption{{Field: &schema.Field{DBName: "name"}}, {Field: &schema.Field{DBName: "name"}}}, // Duplicate
+			},
+		},
+	}
+
+	sql := gen.generateCreateTableSQL(table)
+	// Should only contain "name" once
+	require.Contains(t, sql, "CREATE INDEX idx_products_name ON \"products\" (\"name\");")
+	require.NotContains(t, sql, "(\"name\", \"name\")")
+}
+
+func TestGenerateUpSQL_SchemaCreation(t *testing.T) {
+	gen := NewGenerator("migrations")
+	table := diff.TableDiff{
+		Schema: &schema.Schema{Table: "custom_schema.users"},
+		FieldsToAdd: []*schema.Field{
+			{DBName: "id", DataType: "int", PrimaryKey: true, NotNull: true},
+		},
+	}
+	gen.SchemaDiff = &diff.SchemaDiff{
+		TablesToCreate: []diff.TableDiff{table},
+	}
+
+	sql, err := gen.generateUpSQL()
+	require.NoError(t, err)
+
+	// Should contain schema creation
+	require.Contains(t, sql, "CREATE SCHEMA IF NOT EXISTS \"custom_schema\";")
+	require.Contains(t, sql, "CREATE TABLE \"custom_schema\".\"users\"")
+}
+
+func TestGenerateCreateTableSQL_ForeignKeyTypeMismatch(t *testing.T) {
+	gen := NewGenerator("migrations")
+	table := diff.TableDiff{
+		Schema: &schema.Schema{Table: "orders"},
+		FieldsToAdd: []*schema.Field{
+			{DBName: "id", DataType: "int", PrimaryKey: true, NotNull: true},
+			{DBName: "user_id", DataType: "int", NotNull: true}, // Go type int -> integer (default)
+		},
+		ForeignKeysToAdd: []*schema.Relationship{
+			{
+				Field:  &schema.Field{DBName: "user_id"},
+				Schema: &schema.Schema{Table: "users"},
+				References: []*schema.Reference{
+					{
+						PrimaryKey: &schema.Field{
+							DBName:   "id",
+							DataType: "uint", // Referenced PK is uint (BIGSERIAL -> bigint)
+							Schema:   &schema.Schema{Table: "users"},
+						},
+						ForeignKey: &schema.Field{DBName: "user_id"},
+					},
+				},
+			},
+		},
+	}
+
+	sql := gen.generateCreateTableSQL(table)
+
+	// Should be bigint because referenced PK is uint
+	require.Contains(t, sql, "user_id bigint NOT NULL")
+	require.NotContains(t, sql, "user_id integer")
+}
+
+func TestCreateMigration_DeterministicMetadata(t *testing.T) {
+	t.Cleanup(func() { cleanupTestMigrations(t, "deterministic_metadata") })
+	gen := NewGenerator("migrations")
+	schemaDiff := &diff.SchemaDiff{
+		TablesToCreate: []diff.TableDiff{
+			{
+				Schema: &schema.Schema{Table: "users"},
+				FieldsToAdd: []*schema.Field{
+					{DBName: "id", DataType: "int", PrimaryKey: true},
+				},
+			},
+		},
+	}
+	gen.SetSchemaDiff(schemaDiff)
+
+	err := gen.CreateMigration("deterministic_metadata")
+	require.NoError(t, err)
+
+	// Read generated file
+	files, _ := os.ReadDir("migrations")
+	var content string
+	for _, f := range files {
+		if strings.Contains(f.Name(), "deterministic_metadata") {
+			bytes, _ := os.ReadFile("migrations/" + f.Name())
+			content = string(bytes)
+			break
+		}
+	}
+
+	// Verify CreatedAt parses the version string
+	require.Contains(t, content, "time.Parse(\"20060102150405\",")
+	require.NotContains(t, content, "CreatedAt: time.Now()")
+}
+
+func TestSanitizeConstraintName(t *testing.T) {
+	gen := NewGenerator("migrations")
+
+	// Test basic sanitization
+	name := "fk_schema.table_col_fkey"
+	sanitized := gen.sanitizeConstraintName(name)
+	require.Equal(t, "fk_schema_table_col_fkey", sanitized)
+
+	// Test no change needed
+	name2 := "fk_schema_table_col_fkey"
+	sanitized2 := gen.sanitizeConstraintName(name2)
+	require.Equal(t, "fk_schema_table_col_fkey", sanitized2)
 }
